@@ -1,0 +1,110 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  password      String?
+  emailVerified DateTime?
+  image         String?
+  accounts      Account[]
+  sessions      Session[]
+  strategies    Strategy[]
+  positions     Position[]
+  trades        Trade[]
+  exchanges     Exchange[]
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model Strategy {
+  id          String   @id @default(cuid())
+  name        String
+  type        String
+  description String?
+  parameters  Json
+  isActive    Boolean  @default(true)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  positions   Position[]
+  trades      Trade[]
+  createdAt   DateTime @default(now())
+}
+
+model Position {
+  id              String   @id @default(cuid())
+  symbol          String
+  side            String
+  entryPrice      Float
+  quantity        Float
+  leverage        Int
+  unrealizedPnl   Float    @default(0)
+  stopLoss        Float?
+  takeProfit      Float?
+  status          String   @default("OPEN")
+  userId          String
+  strategyId      String?
+  exchangeId      String?
+  user            User     @relation(fields: [userId], references: [id])
+  strategy        Strategy? @relation(fields: [strategyId], references: [id])
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+model Trade {
+  id          String   @id @default(cuid())
+  symbol      String
+  side        String
+  entryPrice  Float
+  exitPrice   Float?
+  quantity    Float
+  pnl         Float?
+  userId      String
+  strategyId  String?
+  user        User     @relation(fields: [userId], references: [id])
+  strategy    Strategy? @relation(fields: [strategyId], references: [id])
+  createdAt   DateTime @default(now())
+}
+
+model Exchange {
+  id          String   @id @default(cuid())
+  name        String
+  apiKey      String
+  apiSecret   String
+  isTestnet   Boolean  @default(false)
+  isActive    Boolean  @default(true)
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  createdAt   DateTime @default(now())
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}

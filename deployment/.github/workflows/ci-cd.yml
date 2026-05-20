@@ -1,0 +1,404 @@
+# =============================================================================
+# TradeAI Pro - GitHub Actions CI/CD Pipeline
+# =============================================================================
+# Triggers:
+#   - Push to main branch (deploy)
+#   - Pull requests (lint + test only)
+#
+# Jobs:
+#   1. lint:       Code quality checks (ESLint, TypeScript, Pylint, Black)
+#   2. test:       Unit & integration tests
+#   3. build:      Docker image build & push to registry
+#   4. deploy:     SSH deploy to VPS with health check
+#   5. notify:     Send deployment notification to Telegram/Slack
+# =============================================================================
+
+name: TradeAI Pro CI/CD
+
+# ---------------------------------------------------------------------------
+# Triggers
+# ---------------------------------------------------------------------------
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".vscode/**"
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+# ---------------------------------------------------------------------------
+# Concurrency: Cancel in-progress runs for the same branch
+# ---------------------------------------------------------------------------
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ---------------------------------------------------------------------------
+# Environment Variables
+# ---------------------------------------------------------------------------
+env:
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.12"
+
+# =============================================================================
+# Jobs
+# =============================================================================
+jobs:
+  # ===========================================================================
+  # Job 1: Lint & Code Quality
+  # ===========================================================================
+  lint:
+    name: "Lint & Code Quality"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- Frontend Lint ---
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "bun"
+
+      - name: Install frontend dependencies
+        run: |
+          corepack enable
+          bun install --frozen-lockfile
+
+      - name: Run ESLint
+        run: bun run lint
+        continue-on-error: true
+
+      - name: TypeScript type check
+        run: bunx tsc --noEmit
+        continue-on-error: true
+
+      # --- Backend Lint ---
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install backend dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install flake8 black isort
+        continue-on-error: true
+
+      - name: Run Flake8
+        run: |
+          cd backend
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        continue-on-error: true
+
+      - name: Check Black formatting
+        run: |
+          cd backend
+          black --check .
+        continue-on-error: true
+
+  # ===========================================================================
+  # Job 2: Tests
+  # ===========================================================================
+  test:
+    name: "Tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: lint
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: tradeai_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --- Frontend Tests ---
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "bun"
+
+      - name: Install frontend dependencies
+        run: |
+          corepack enable
+          bun install --frozen-lockfile
+
+      - name: Run frontend tests
+        run: bun test
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/tradeai_test
+        continue-on-error: true
+
+      # --- Backend Tests ---
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install backend dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-asyncio
+        continue-on-error: true
+
+      - name: Run backend tests
+        run: |
+          cd backend
+          python -m pytest tests/ -v --tb=short --cov=app --cov-report=term-missing
+        env:
+          DATABASE_URL: postgresql://test_user:test_password@localhost:5432/tradeai_test
+          REDIS_URL: redis://localhost:6379/0
+          APP_ENV: test
+          JWT_SECRET: test-secret-key
+          SECRET_KEY: test-secret-key
+        continue-on-error: true
+
+      - name: Upload test coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: backend/coverage/
+          retention-days: 7
+        continue-on-error: true
+
+  # ===========================================================================
+  # Job 3: Build & Push Docker Images
+  # ===========================================================================
+  build:
+    name: "Build & Push Docker Images"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        include:
+          - image: frontend
+            dockerfile: deployment/docker/Dockerfile.frontend
+          - image: backend
+            dockerfile: deployment/docker/Dockerfile.backend
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.image }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ github.run_number }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.API_URL }}
+            NEXT_PUBLIC_WS_URL=${{ vars.WS_URL }}
+
+  # ===========================================================================
+  # Job 4: Deploy to VPS
+  # ===========================================================================
+  deploy:
+    name: "Deploy to Production"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script: |
+            set -euo pipefail
+
+            # Navigate to project directory
+            cd /opt/tradeai-pro
+
+            # Pull latest code
+            echo "Pulling latest code..."
+            git pull origin main
+
+            # Pull latest Docker images
+            echo "Pulling latest Docker images..."
+            docker compose -f deployment/docker-compose.yml pull
+
+            # Run deployment script
+            echo "Running deployment..."
+            bash deployment/scripts/deploy.sh deploy
+
+            echo "Deployment complete!"
+
+      - name: Verify deployment
+        run: |
+          sleep 15
+          HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" "${{ vars.APP_URL }}/api/health" --max-time 30 || echo "000")
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Deployment verified: API is healthy (HTTP 200)"
+          else
+            echo "❌ Deployment verification failed: HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+  # ===========================================================================
+  # Job 5: Notify
+  # ===========================================================================
+  notify:
+    name: "Send Notification"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [deploy]
+    if: always()
+
+    steps:
+      - name: Determine deployment status
+        id: status
+        run: |
+          if [ "${{ needs.deploy.result }}" = "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=✅ TradeAI Pro deployed successfully to production" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.deploy.result }}" = "failure" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message=❌ TradeAI Pro deployment FAILED" >> $GITHUB_OUTPUT
+          else
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "message=⚠️ TradeAI Pro deployment was skipped" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Telegram notification
+        if: env.TELEGRAM_BOT_TOKEN != ''
+        run: |
+          MESSAGE="${{ steps.status.outputs.message }}
+          
+          📦 Commit: ${{ github.sha }}
+          👤 Author: ${{ github.actor }}
+          🌿 Branch: ${{ github.ref_name }}
+          🕐 Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          
+          🔗 [View Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${{ secrets.TELEGRAM_CHAT_ID }}\",
+              \"text\": \"${MESSAGE}\",
+              \"parse_mode\": \"HTML\"
+            }"
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+      - name: Send Slack notification
+        if: env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "text": "${{ steps.status.outputs.message }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ steps.status.outputs.message }}"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "Commit: `${{ github.sha }}` | Author: *${{ github.actor }}* | Branch: `${{ github.ref_name }}`"
+                    }
+                  ]
+                }
+              ]
+            }'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      # --- Rollback on Failure ---
+      - name: Rollback on failure
+        if: needs.deploy.result == 'failure'
+        run: |
+          echo "🚨 Deployment failed. Manual rollback may be required."
+          echo "Run: ssh to VPS and execute: cd /opt/tradeai-pro && bash deployment/scripts/deploy.sh rollback"

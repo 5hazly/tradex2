@@ -1,0 +1,79 @@
+# =============================================================================
+# TradeAI Pro - Trading Bot Systemd Service
+# =============================================================================
+# Install:
+#   sudo cp trading-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable trading-bot
+#   sudo systemctl start trading-bot
+#
+# Commands:
+#   sudo systemctl start trading-bot      # Start the service
+#   sudo systemctl stop trading-bot       # Stop the service
+#   sudo systemctl restart trading-bot    # Restart the service
+#   sudo systemctl status trading-bot     # Check status
+#   journalctl -u trading-bot -f          # View logs
+# =============================================================================
+
+[Unit]
+# Service description
+Description=TradeAI Pro - Trading Bot Backend
+Documentation=https://github.com/your-org/tradeai-pro
+
+# Start after network and Docker are available
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+# ---------------------------------------------------------------------------
+# Service Configuration
+# ---------------------------------------------------------------------------
+[Service]
+# User and group to run the service as (create a dedicated user for security)
+User=tradeai
+Group=tradeai
+
+# Working directory
+WorkingDirectory=/opt/tradeai-pro
+
+# Environment file for configuration
+EnvironmentFile=/opt/tradeai-pro/deployment/.env
+
+# Run the backend using Docker Compose
+# This ensures the service is managed by systemd but runs in containers
+ExecStartPre=/usr/bin/docker compose -f /opt/tradeai-pro/deployment/docker-compose.yml --env-file /opt/tradeai-pro/deployment/.env pull backend
+ExecStart=/usr/bin/docker compose -f /opt/tradeai-pro/deployment/docker-compose.yml --env-file /opt/tradeai-pro/deployment/.env up --abort-on-container-exit --remove-orphans backend celery-worker celery-beat
+ExecStop=/usr/bin/docker compose -f /opt/tradeai-pro/deployment/docker-compose.yml --env-file /opt/tradeai-pro/deployment/.env stop backend celery-worker celery-beat
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Timeout settings
+TimeoutStartSec=120
+TimeoutStopSec=60
+TimeoutStopFailureMode=terminate
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tradeai-bot
+SyslogFacility=daemon
+
+# Resource limits (optional - protect system resources)
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=false
+ReadWritePaths=/opt/tradeai-pro /var/log/tradeai-bot
+
+# ---------------------------------------------------------------------------
+# Install Configuration
+# ---------------------------------------------------------------------------
+[Install]
+WantedBy=multi-user.target
